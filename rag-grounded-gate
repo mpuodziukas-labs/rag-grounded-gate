@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""rag-grounded-gate - deterministic groundedness check for RAG answers.
+Read-only, stdlib-only, no network.
+"""
+import sys, os, re, json, hashlib, tempfile, shutil
+from datetime import datetime, timezone
+
+EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ABSTAIN = "insufficient context"
+
+def now_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()
+
+def load_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+REQUIRED_ANSWER_FIELDS = {
+    "question": str, "answer": str, "citations": list,
+    "retrieved_chunks_count": int, "grounded_sha256": list,
+    "generated_utc": str, "stale_flag": bool,
+}
+
+def check_schema(answer, chunks_dir):
+    if not isinstance(answer, dict):
+        return False, "root: not object"
+    for field, typ in REQUIRED_ANSWER_FIELDS.items():
+        if field not in answer:
+            return False, f"{field}: missing"
+        val = answer[field]
+        if typ is int and isinstance(val, bool):
+            return False, f"{field}: wrong type"
+        if not isinstance(val, typ):
+            return False, f"{field}: wrong type"
+    for c in answer["citations"]:
+        if not isinstance(c, dict):
+            return False, "citations: item not object"
+        for f in ("span", "chunk_id"):
+            if f not in c or not isinstance(c[f], str):
+                return False, f"citations.{f}: missing or wrong type"
+    for s in answer["grounded_sha256"]:
+        if not isinstance(s, str):
+            return False, "grounded_sha256: item not str"
+    for c in answer["citations"]:
+        chunk_id = c["chunk_id"]
+        meta_path = os.path.join(chunks_dir, f"{chunk_id}.meta.json")
+        if not os.path.isfile(meta_path):
+            return False, f"meta {chunk_id}: missing meta.json"
+        try:
+            meta = load_json(meta_path)
+        except Exception:
+            return False, f"meta {chunk_id}: parse error"
+        if not isinstance(meta, dict):
+            return False, f"meta {chunk_id}: not object"
+        for f in ("utc", "url", "sha256"):
+            if f not in meta or not isinstance(meta[f], str):
+                return False, f"meta {chunk_id}.{f}: missing or wrong type"
+        if not re.fullmatch(r"[0-9a-f]{64}", meta["sha256"]):
+            return False, f"meta {chunk_id}.sha256: not 64 hex"
+    return True, "schema ok"
+
+def check_citation_span(answer, chunks_dir):
+    for c in answer.get("citations", []):
+        span = c.get("span", "")
+        chunk_id = c.get("chunk_id", "")
+        txt_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
+        if not os.path.isfile(txt_path):
+            return False, f"missing chunk file for citation {chunk_id}"
+        with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
+            body = f.read()
+        if span not in body:
+            return False, f"span not verbatim in chunk {chunk_id}: {span!r}"
+    return True, "all citation spans matched verbatim"
+
+def check_abstain_on_empty(answer):
+    grounded = answer.get("grounded_sha256", []) or []
+    condition = (answer.get("retrieved_chunks_count", 0) == 0) or (EMPTY_SHA in grounded)
+    if not condition:
+        return True, "N/A (retrieval non-empty, no EMPTY_SHA)", False
+    ok = answer.get("answer") == ABSTAIN
+    detail = "abstained correctly" if ok else f"empty retrieval but answer != {ABSTAIN!r}"
+    return ok, detail, True
+
+def check_sha_pin(answer, chunks_dir):
+    grounded = answer.get("grounded_sha256", []) or []
+    if EMPTY_SHA in grounded:
+        return False, "EMPTY_SHA present in grounded_sha256"
+    for c in answer.get("citations", []):
+        chunk_id = c.get("chunk_id", "")
+        txt_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
+        if not os.path.isfile(txt_path):
+            return False, f"missing chunk file for sha check {chunk_id}"
+        actual = sha256_file(txt_path)
+        if actual not in grounded:
+            return False, f"chunk {chunk_id} sha256 {actual} not in grounded_sha256"
+    return True, "all cited chunk hashes pinned in grounded_sha256"
+
+def check_source_floor(answer, source_min):
+    grounded = answer.get("grounded_sha256", []) or []
+    distinct = len(set(grounded))
+    ok = distinct >= source_min
+    return ok, f"{distinct} distinct grounded_sha256 (min {source_min})"
+def parse_utc(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+def check_freshness(answer, chunks_dir, ttl):
+    gen = answer.get("generated_utc")
+    if not gen:
+        return False, "answer missing generated_utc"
+    try:
+        gen_dt = parse_utc(gen)
+    except Exception as e:
+        return False, f"bad generated_utc: {e}"
+    stale_flag = answer.get("stale_flag", False) is True
+    for c in answer.get("citations", []):
+        chunk_id = c.get("chunk_id", "")
+        meta_path = os.path.join(chunks_dir, f"{chunk_id}.meta.json")
+        if not os.path.isfile(meta_path):
+            return False, f"missing meta.json for {chunk_id}"
+        try:
+            meta = load_json(meta_path)
+            chunk_dt = parse_utc(meta.get("utc", ""))
+        except Exception as e:
+            return False, f"bad chunk utc for {chunk_id}: {e}"
+        if abs((gen_dt - chunk_dt).total_seconds()) > ttl and not stale_flag:
+            return False, f"chunk {chunk_id} stale (> ttl {ttl}s)"
+    return True, "all cited chunks within ttl (or stale_flag set)"
+def split_sentences(text):
+    parts = re.split(r'[.!?]+\s*', text)
+    return [p.strip() for p in parts if p.strip()]
+def check_attribution_ratio(answer, chunks_dir, attr_min):
+    sentences = split_sentences(answer.get("answer", ""))
+    total = len(sentences)
+    if total == 0:
+        return True, "0/0"
+    verified_spans = []
+    for c in answer.get("citations", []):
+        span = c.get("span", "")
+        chunk_id = c.get("chunk_id", "")
+        txt_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
+        if not span or not os.path.isfile(txt_path):
+            continue
+        with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
+            body = f.read()
+        if span in body:
+            verified_spans.append(span)
+    attributed = sum(1 for s in sentences if any(span in s for span in verified_spans))
+    ratio = attributed / total
+    ok = ratio >= attr_min
+    return ok, f"{attributed}/{total}"
+
+def run_check(answer_path, chunks_dir, source_min, ttl=604800, attr_min=0.9):
+    try:
+        answer = load_json(answer_path)
+    except Exception as e:
+        return None, f"parse error: {e}"
+    schema_ok, schema_detail = check_schema(answer, chunks_dir)
+    if not schema_ok:
+        verdict = {"checked_at": now_utc(), "ok": False, "checks": {"schema": {"ok": False, "detail": schema_detail}}}
+        return verdict, None
+    checks = {}
+    abstain_ok, abstain_detail, abstained_required = check_abstain_on_empty(answer)
+    checks["abstain_on_empty"] = {"ok": abstain_ok, "detail": abstain_detail}
+    # EXTENSION POINT: item 5 (contradiction-check) unimplemented; 3/7 are subcommands below.
+    if abstained_required:
+        checks["citation_span"] = {"ok": True, "detail": "N/A (abstain-required)"}
+        checks["sha_pin"] = {"ok": True, "detail": "N/A (abstain-required)"}
+        checks["source_floor"] = {"ok": True, "detail": "N/A (abstain-required)"}
+        checks["freshness"] = {"ok": True, "detail": "N/A (abstain-required)"}
+        checks["attribution_ratio"] = {"ok": True, "detail": "N/A (abstain-required)"}
+    else:
+        ok, detail = check_citation_span(answer, chunks_dir)
+        checks["citation_span"] = {"ok": ok, "detail": detail}
+        ok, detail = check_sha_pin(answer, chunks_dir)
+        checks["sha_pin"] = {"ok": ok, "detail": detail}
+        ok, detail = check_source_floor(answer, source_min)
+        checks["source_floor"] = {"ok": ok, "detail": detail}
+        ok, detail = check_freshness(answer, chunks_dir, ttl)
+        checks["freshness"] = {"ok": ok, "detail": detail}
+        ok, detail = check_attribution_ratio(answer, chunks_dir, attr_min)
+        checks["attribution_ratio"] = {"ok": ok, "detail": detail}
+    overall_ok = all(v["ok"] for v in checks.values())
+    verdict = {"checked_at": now_utc(), "ok": overall_ok, "checks": checks}
+    return verdict, None
+
+def strip_checked_at(v):
+    v = dict(v)
+    v.pop("checked_at", None)
+    return v
+
+def replay_equal(v1, v2):
+    return strip_checked_at(v1) == strip_checked_at(v2)
+
+def cmd_check(args):
+    if len(args) < 2:
+        print("usage: rag-grounded-gate check answer.json chunks-dir [--source-min N] [--ttl SECONDS] [--attr-min FLOAT]", file=sys.stderr)
+        return 2
+    answer_path, chunks_dir = args[0], args[1]
+    casts = {"--source-min": int, "--ttl": int, "--attr-min": float}
+    vals = {"--source-min": 2, "--ttl": 604800, "--attr-min": 0.9}
+    rest = args[2:]
+    i = 0
+    while i < len(rest):
+        flag = rest[i]
+        if flag in casts and i + 1 < len(rest):
+            try:
+                vals[flag] = casts[flag](rest[i + 1])
+            except ValueError:
+                print(f"bad {flag} value", file=sys.stderr)
+                return 2
+            i += 2
+        else:
+            print(f"unknown arg {flag}", file=sys.stderr)
+            return 2
+    if not os.path.isfile(answer_path) or not os.path.isdir(chunks_dir):
+        print("answer.json or chunks-dir not found", file=sys.stderr)
+        return 2
+    verdict, err = run_check(answer_path, chunks_dir, vals["--source-min"], vals["--ttl"], vals["--attr-min"])
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+    print(json.dumps(verdict))
+    if "schema" in verdict["checks"] and not verdict["checks"]["schema"]["ok"]:
+        return 2
+    return 0 if verdict["ok"] else 1
+
+def run_canary_like(jsonl_path, answers_dir, label):
+    rows = []
+    try:
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append(json.loads(line))
+    except Exception as e:
+        return None, f"parse error: {e}"
+    if not rows:
+        return None, "empty jsonl"
+    results = []
+    all_ok = True
+    for row in rows:
+        rid = row.get("id")
+        if rid is None:
+            return None, "row missing id"
+        answer_path = os.path.join(answers_dir, f"{rid}.json")
+        if not os.path.isfile(answer_path):
+            all_ok = False
+            results.append({"id": rid, "ok": False, "detail": "missing answer file"})
+            continue
+        try:
+            ans = load_json(answer_path)
+        except Exception as e:
+            return None, f"parse error in {answer_path}: {e}"
+        ok = ans.get("answer") == ABSTAIN
+        if not ok:
+            all_ok = False
+        results.append({"id": rid, "ok": ok, "detail": "abstained" if ok else "non-abstain"})
+    verdict = {"checked_at": now_utc(), "ok": all_ok, "label": label, "results": results}
+    return verdict, None
+
+def cmd_canary_like(args, label):
+    if len(args) < 2:
+        print(f"usage: rag-grounded-gate {label} set.jsonl answers-dir", file=sys.stderr)
+        return 2
+    jsonl_path, answers_dir = args[0], args[1]
+    if not os.path.isfile(jsonl_path) or not os.path.isdir(answers_dir):
+        print("jsonl or answers-dir not found", file=sys.stderr)
+        return 2
+    verdict, err = run_canary_like(jsonl_path, answers_dir, label)
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+    print(json.dumps(verdict))
+    return 0 if verdict["ok"] else 1
+
+def cmd_replay(args):
+    if len(args) < 2:
+        print("usage: rag-grounded-gate replay v1.json v2.json", file=sys.stderr)
+        return 2
+    try:
+        v1 = load_json(args[0])
+        v2 = load_json(args[1])
+    except Exception as e:
+        print(f"parse error: {e}", file=sys.stderr)
+        return 2
+    eq = replay_equal(v1, v2)
+    print(json.dumps({"ok": eq, "detail": "identical" if eq else "differ"}))
+    return 0 if eq else 1
+
+def make_chunk(chunks_dir, chunk_id, body, url="http://example.com/x", utc=None):
+    txt_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
+    with open(txt_path, "w") as f:
+        f.write(body)
+    sha = sha256_file(txt_path)
+    meta = {"utc": utc or now_utc(), "url": url, "sha256": sha}
+    with open(os.path.join(chunks_dir, f"{chunk_id}.meta.json"), "w") as f:
+        json.dump(meta, f)
+    return sha
+
+def selftest():
+    results = []
+    tmp = tempfile.mkdtemp(prefix="rag-grounded-gate-selftest-")
+    try:
+        chunks_dir = os.path.join(tmp, "chunks")
+        os.makedirs(chunks_dir)
+        sha1 = make_chunk(chunks_dir, "c1", "The sky is blue over the valley.")
+        sha2 = make_chunk(chunks_dir, "c2", "Water boils at 100C at sea level.")
+
+        base = {
+            "question": "q",
+            "answer": "The sky is blue and water boils at 100C.",
+            "citations": [
+                {"span": "sky is blue", "chunk_id": "c1"},
+                {"span": "boils at 100C", "chunk_id": "c2"},
+            ],
+            "retrieved_chunks_count": 2,
+            "grounded_sha256": [sha1, sha2],
+            "generated_utc": now_utc(),
+            "stale_flag": False,
+        }
+
+        def write_answer(name, obj):
+            p = os.path.join(tmp, name)
+            json.dump(obj, open(p, "w"))
+            return p
+
+        # PASS: fully grounded, 2 distinct sources, no abstain required
+        p = write_answer("a_pass.json", base)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("overall-pass", err is None and v["ok"] is True))
+
+        # FAIL: citation_span - span not verbatim in cited chunk
+        bad = dict(base)
+        bad["citations"] = [{"span": "nonexistent phrase xyz", "chunk_id": "c1"}]
+        p = write_answer("a_span_fail.json", bad)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("citation_span-fail", err is None and v["checks"]["citation_span"]["ok"] is False and v["ok"] is False))
+
+        # FAIL: abstain_on_empty - empty retrieval but no abstain literal
+        bad = dict(base)
+        bad["retrieved_chunks_count"] = 0
+        bad["answer"] = "The sky is blue."
+        p = write_answer("a_abstain_fail.json", bad)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("abstain_on_empty-fail", err is None and v["checks"]["abstain_on_empty"]["ok"] is False and v["ok"] is False))
+
+        # FAIL: sha_pin - tampered grounded_sha256
+        bad = dict(base)
+        bad["grounded_sha256"] = [sha1, "deadbeef" * 8]
+        p = write_answer("a_sha_fail.json", bad)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("sha_pin-fail", err is None and v["checks"]["sha_pin"]["ok"] is False and v["ok"] is False))
+
+        # FAIL: source_floor - only 1 distinct source, min is 2
+        bad = dict(base)
+        bad["grounded_sha256"] = [sha1, sha1]
+        bad["citations"] = [{"span": "sky is blue", "chunk_id": "c1"}]
+        p = write_answer("a_source_fail.json", bad)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("source_floor-fail", err is None and v["checks"]["source_floor"]["ok"] is False and v["ok"] is False))
+
+        # replay: identical (same input re-checked -> only checked_at differs)
+        v_r1, _ = run_check(p, chunks_dir, 2)
+        v_r2, _ = run_check(p, chunks_dir, 2)
+        results.append(("replay-identical", replay_equal(v_r1, v_r2) is True))
+
+        # replay: differ (verdict content mutated)
+        v_r3 = dict(v_r2)
+        v_r3["ok"] = not v_r3["ok"]
+        results.append(("replay-differ", replay_equal(v_r1, v_r3) is False))
+
+        # PASS: freshness - chunk utc close to generated_utc, within default ttl
+        p = write_answer("a_fresh_pass.json", base)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("freshness-pass", err is None and v["checks"]["freshness"]["ok"] is True))
+
+        # FAIL: freshness - chunk utc far outside ttl, no stale_flag
+        sha3 = make_chunk(chunks_dir, "c3", "The moon is far away.", utc="2000-01-01T00:00:00Z")
+        bad = dict(base)
+        bad["citations"] = [{"span": "moon is far away", "chunk_id": "c3"}]
+        bad["grounded_sha256"] = [sha3]
+        p = write_answer("a_fresh_fail.json", bad)
+        v, err = run_check(p, chunks_dir, 1)
+        results.append(("freshness-fail", err is None and v["checks"]["freshness"]["ok"] is False and v["ok"] is False))
+
+        # PASS: attribution_ratio - every sentence has a matching verbatim citation
+        good = dict(base)
+        good["answer"] = "The sky is blue. Water boils at 100C."
+        p = write_answer("a_attr_pass.json", good)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("attribution_ratio-pass", err is None and v["checks"]["attribution_ratio"]["ok"] is True and v["checks"]["attribution_ratio"]["detail"] == "2/2"))
+
+        # FAIL: attribution_ratio - extra uncited sentence drags ratio below default 0.9
+        bad = dict(base)
+        bad["answer"] = "The sky is blue. Water boils at 100C. Grass is green for no cited reason."
+        p = write_answer("a_attr_fail.json", bad)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("attribution_ratio-fail", err is None and v["checks"]["attribution_ratio"]["ok"] is False and v["ok"] is False))
+
+        # canary / negcontrol shared-implementation fixtures
+        canary_dir = os.path.join(tmp, "canary_answers")
+        os.makedirs(canary_dir)
+        json.dump({"question": "q1", "answer": ABSTAIN}, open(os.path.join(canary_dir, "q1.json"), "w"))
+        json.dump({"question": "q2", "answer": ABSTAIN}, open(os.path.join(canary_dir, "q2.json"), "w"))
+        json.dump({"question": "q3", "answer": "The sky is blue."}, open(os.path.join(canary_dir, "q3.json"), "w"))
+
+        jsonl_pass = os.path.join(tmp, "set_pass.jsonl")
+        with open(jsonl_pass, "w") as f:
+            f.write(json.dumps({"id": "q1", "question": "Q1?"}) + "\n")
+            f.write(json.dumps({"id": "q2", "question": "Q2?"}) + "\n")
+
+        jsonl_fail = os.path.join(tmp, "set_fail.jsonl")
+        with open(jsonl_fail, "w") as f:
+            f.write(json.dumps({"id": "q1", "question": "Q1?"}) + "\n")
+            f.write(json.dumps({"id": "q3", "question": "Q3?"}) + "\n")
+
+        # PASS: canary - all rows abstained
+        v, err = run_canary_like(jsonl_pass, canary_dir, "canary")
+        results.append(("canary-pass", err is None and v["ok"] is True))
+
+        # FAIL: canary - one row non-abstain
+        v, err = run_canary_like(jsonl_fail, canary_dir, "canary")
+        results.append(("canary-fail", err is None and v["ok"] is False))
+
+        # PASS: negcontrol - shared implementation, distinct label, all abstained
+        v, err = run_canary_like(jsonl_pass, canary_dir, "negcontrol")
+        results.append(("negcontrol-pass", err is None and v["ok"] is True and v["label"] == "negcontrol"))
+
+        # FAIL: negcontrol - one row non-abstain
+        v, err = run_canary_like(jsonl_fail, canary_dir, "negcontrol")
+        results.append(("negcontrol-fail", err is None and v["ok"] is False))
+
+        # SCHEMA FAIL: answer missing grounded_sha256 -> rc 2, named schema check
+        bad = dict(base)
+        del bad["grounded_sha256"]
+        p = write_answer("a_schema_missing_field.json", bad)
+        rc = cmd_check([p, chunks_dir])
+        results.append(("schema-missing-field-rc2", rc == 2))
+
+        # SCHEMA FAIL: cited chunk meta.json missing sha256 -> rc 2
+        meta_path = os.path.join(chunks_dir, "c1.meta.json")
+        orig_meta = load_json(meta_path)
+        stripped_meta = {"utc": orig_meta["utc"], "url": orig_meta["url"]}
+        json.dump(stripped_meta, open(meta_path, "w"))
+        p = write_answer("a_schema_missing_meta_sha.json", base)
+        rc = cmd_check([p, chunks_dir])
+        results.append(("schema-missing-meta-sha-rc2", rc == 2))
+        json.dump(orig_meta, open(meta_path, "w"))  # restore
+
+        # SCHEMA FAIL: citations not a list -> rc 2
+        bad = dict(base)
+        bad["citations"] = "not-a-list"
+        p = write_answer("a_schema_citations_notlist.json", bad)
+        rc = cmd_check([p, chunks_dir])
+        results.append(("schema-citations-notlist-rc2", rc == 2))
+
+        # SCHEMA PASS: fully valid answer still rc 0
+        p = write_answer("a_schema_valid.json", base)
+        rc = cmd_check([p, chunks_dir])
+        results.append(("schema-valid-rc0", rc == 0))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    passed = sum(1 for _, ok in results if ok)
+    total = len(results)
+    failed = total - passed
+    for name, ok in results:
+        if not ok:
+            print(f"  FAIL: {name}", file=sys.stderr)
+    print(f"rag-grounded-gate selftest: {passed}/{total} PASS {failed} FAIL")
+    return 0 if failed == 0 else 1
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        print("usage: rag-grounded-gate {check|replay|--selftest} ...", file=sys.stderr)
+        return 2
+    if argv[0] == "--selftest":
+        return selftest()
+    if argv[0] == "check":
+        return cmd_check(argv[1:])
+    if argv[0] == "replay":
+        return cmd_replay(argv[1:])
+    if argv[0] == "canary":
+        return cmd_canary_like(argv[1:], "canary")
+    if argv[0] == "negcontrol":
+        return cmd_canary_like(argv[1:], "negcontrol")
+    print(f"unknown subcommand: {argv[0]}", file=sys.stderr)
+    return 2
+
+if __name__ == "__main__":
+    sys.exit(main())
