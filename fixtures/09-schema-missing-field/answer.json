@@ -1,0 +1,15 @@
+{
+  "question": "Why might a scraper get blocked?",
+  "answer": "A scraper might get blocked for numerous reasons.",
+  "citations": [
+    {
+      "span": "A scraper might get blocked for numerous reasons",
+      "chunk_id": "chunkA"
+    }
+  ],
+  "retrieved_chunks_count": 1,
+  "grounded_sha256": [
+    "204c4e739dc025cfd1bdd966f833b22873e49ad1f74d147b0e75991b3dc3c1c0"
+  ],
+  "stale_flag": false
+}

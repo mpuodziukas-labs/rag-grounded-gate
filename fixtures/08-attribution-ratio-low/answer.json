@@ -1,0 +1,21 @@
+{
+  "question": "What are the two main reasons a scraper might get blocked, and what do the exclusion rules represent?",
+  "answer": "A scraper might get blocked for numerous reasons. These rules are not a form of access authorization. Also, grass is green for entirely unrelated reasons.",
+  "citations": [
+    {
+      "span": "A scraper might get blocked for numerous reasons",
+      "chunk_id": "chunkA"
+    },
+    {
+      "span": "These rules are not a form of access authorization",
+      "chunk_id": "chunkC"
+    }
+  ],
+  "retrieved_chunks_count": 2,
+  "grounded_sha256": [
+    "204c4e739dc025cfd1bdd966f833b22873e49ad1f74d147b0e75991b3dc3c1c0",
+    "64ebf93796069acbe1bb180b0f5f3f3e551327182f555f33a26810d9fc261e43"
+  ],
+  "generated_utc": "2026-09-12T06:25:57Z",
+  "stale_flag": false
+}
