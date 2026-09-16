@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mpuodziukas-labs/rag-grounded-gate/answer.schema.json",
   "title": "rag-grounded-gate answer.json",
-  "description": "Contract for the answer.json input consumed by rag-grounded-gate check. This file documents the same constraints check_schema() enforces in rag-grounded-gate; it is not run by the tool itself.",
+  "description": "Contract for the answer.json input consumed by rag-grounded-gate check. It is not run by the tool, and it is not byte-equivalent to check_schema(): the schema is stricter on retrieved_chunks_count (minimum 0) and generated_utc (pattern), which the gate enforces later as exit 1 rather than at schema time, and looser on chunk_id, whose pattern admits '..' while the gate rejects it with exit 2. Validate against both.",
   "type": "object",
   "required": [
     "question",
@@ -36,7 +36,7 @@
           "chunk_id": {
             "type": "string",
             "pattern": "^[A-Za-z0-9._-]+$",
-            "description": "Restricted to a safe filename character set. No '/', '\\', or '..' segments; the gate resolves this against chunks_dir as <chunk_id>.txt and <chunk_id>.meta.json."
+            "description": "Restricted to a safe filename character set. The pattern above excludes '/' and '\\' but does NOT exclude '..'; the gate applies that additional rejection itself (exit 2, 'chunk_id: invalid path segment'). The gate resolves this against chunks_dir as <chunk_id>.txt and <chunk_id>.meta.json."
           }
         }
       }

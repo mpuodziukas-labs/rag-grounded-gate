@@ -1,0 +1,22 @@
+name: verify
+
+# The repo renders its own verdict on every change: selftest asserts its own count,
+# REPRO.sh asserts the literal "32/32 PASS 0 FAIL" string (not the exit code), so a
+# silently shrunken selftest fails here without the author present. No network, stdlib only.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: selftest (asserts 32/32 PASS 0 FAIL)
+        run: ./rag-grounded-gate --selftest
+      - name: repro every fixture row and the asserted count
+        run: bash REPRO.sh

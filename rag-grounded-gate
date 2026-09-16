@@ -130,7 +130,7 @@ def check_source_floor(answer, chunks_dir, source_min):
             sha = meta.get("sha256")
         except Exception:
             pass
-        sources.add(url or sha or chunk_id)
+        sources.add(url.strip() if isinstance(url, str) and url.strip() else "__no_url__")
     distinct = len(sources)
     ok = distinct >= source_min
     return ok, f"{distinct} distinct sources (min {source_min})"

@@ -12,7 +12,10 @@ empty.
 
 * Deterministic: same inputs give the same verdict and exit code; only the `checked_at`
   timestamp in the verdict JSON changes between runs. No sampling, no model call.
-* Offline: no network. Nothing about your data leaves the process.
+* Offline: no network; the process makes no outbound connection. It does print your data back:
+  the verdict JSON embeds cited span text verbatim in failure details (for example a citation_span
+  failure echoes the offending span), along with chunk ids and chunk SHA-256s. Treat the verdict
+  output as being as sensitive as the answers it judges.
 * Self-proving: `./rag-grounded-gate --selftest` builds its own fixtures in a temp directory
   and runs 32 assertions across every check. No external data needed.
 
@@ -22,7 +25,7 @@ empty.
 git clone https://github.com/mpuodziukas-labs/rag-grounded-gate
 cd rag-grounded-gate
 
-./rag-grounded-gate --selftest      # prints 7 verdict lines + 32/32 pass
+./rag-grounded-gate --selftest      # asserts 32/32 PASS 0 FAIL (also prints the schema sub-tests' verdict JSON)
 bash REPRO.sh                       # reproduces every row of FIXTURE-TABLE.md
 ```
 
@@ -31,13 +34,13 @@ You only need Python 3. There are no third-party dependencies.
 ## What it checks
 
 `./rag-grounded-gate check <answer.json> <chunks_dir> [--source-min N] [--ttl N] [--attr-min F]`
-writes a verdict JSON and returns one of three exit codes:
+prints a verdict JSON to stdout and returns one of three exit codes:
 
 | exit code | meaning |
 |---|---|
 | `0` | grounded: every check passed, or a correct abstention on empty retrieval |
 | `1` | ungrounded: a groundedness check failed (bad span, unpinned hash, low attribution, stale chunk, abstention violated, or source floor not met) |
-| `2` | malformed input: the answer JSON failed schema validation |
+| `2` | malformed input or bad invocation: the answer JSON was unparseable or failed schema validation, a cited chunk's metadata sidecar was missing or invalid, or an argument (missing path, unknown flag, bad flag value, unknown subcommand) was rejected |
 
 There are seven checks (`schema`, `abstain_on_empty`, `citation_span`, `sha_pin`, `source_floor`,
 `freshness`, `attribution_ratio`) and nine fixtures: two that pass and seven that each force one
@@ -51,7 +54,9 @@ Defaults: `--ttl 604800` (7 days), `--source-min 2` (distinct source URLs, see p
 `--attr-min 0.9` (90% of the answer's sentences must be attributed to a verified citation).
 
 `answer.schema.json` in this repo is a standalone JSON Schema (draft 2020-12) describing the
-`answer.json` contract, so a consumer can validate an answer file without running this tool.
+`answer.json` contract, so a consumer can pre-validate an answer file without running this tool.
+The schema and the gate's own `check_schema()` are deliberately not identical, and the schema's
+field descriptions say where they diverge.
 
 ## What "grounded" means here (and what it doesn't)
 
@@ -83,7 +88,8 @@ substring test, so a valid answer that paraphrases, resolves coreference, or agg
 chunks can be marked ungrounded when it isn't. Fixture 04 is exactly that case on purpose: its
 cited span changes one word of the chunk, and the gate rejects it because a paraphrase is not a
 verbatim citation. That trade-off is deliberate: the gate won't try
-to adjudicate semantic entailment, which is exactly where an LLM judge tends to hallucinate. Its
+to adjudicate semantic entailment, which is the judgment an LLM grader is trusted to make and the
+one this gate refuses to make. Its
 job is verbatim-span faithfulness and abstention discipline, the two properties a model-risk
 auditor can check without trusting a model. Use it as a fail-closed floor, not as a replacement
 for human review of paraphrase-heavy answers.
@@ -104,6 +110,9 @@ for human review of paraphrase-heavy answers.
   across multiple chunks is sound.
 * Abstention is recognized only as the exact literal string `insufficient context`. Any other
   refusal wording counts as an answer, by design, so abstention stays machine-checkable.
+* An answer with no sentence content (for example the empty string) has an attribution denominator
+  of zero, reported as `0/0`, and is scored grounded (exit `0`) as long as its citations verify. The
+  gate checks that what an answer asserts is cited; it does not check that an answer asserts anything.
 
 ## Deeper evaluation (not bundled)
 
