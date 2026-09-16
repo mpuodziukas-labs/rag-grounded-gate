@@ -10,7 +10,8 @@ every cited span is found verbatim inside a retrieved chunk, the cited chunks ar
 the source floor and attribution ratio hold, and the answer abstains when retrieval comes back
 empty.
 
-* Deterministic: same inputs give the same verdict and exit code. No sampling, no model call.
+* Deterministic: same inputs give the same verdict and exit code; only the `checked_at`
+  timestamp in the verdict JSON changes between runs. No sampling, no model call.
 * Offline: no network. Nothing about your data leaves the process.
 * Self-proving: `./rag-grounded-gate --selftest` builds its own fixtures in a temp directory
   and runs 32 assertions across every check. No external data needed.
@@ -61,8 +62,9 @@ An answer is grounded when all of these hold:
 3. every cited chunk's SHA-256 is pinned in the answer's `grounded_sha256`,
 4. every cited chunk is inside the freshness TTL or carries an explicit stale flag,
 5. the attribution ratio is met and the cited chunks come from at least `--source-min` distinct
-   source URLs (read from each cited chunk's `meta.json`, not distinct SHA-256 hashes: two
-   different chunks from the same URL count as one source), and
+   source URLs (read from each cited chunk's metadata sidecar, `chunkA.meta.json` beside
+   `chunkA.txt` in fixture 01, not from distinct SHA-256 hashes: two different chunks from the
+   same URL count as one source), and
 6. on empty retrieval the answer abstains with the literal string `insufficient context`
    (an exact match; any other refusal wording counts as answering, by design, so that
    abstention is machine-checkable rather than interpreted).

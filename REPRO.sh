@@ -5,9 +5,11 @@ set -euo pipefail
 GATE=./rag-grounded-gate
 
 # 1. Self-contained selftest (builds its own fixtures in a tempdir). The count is asserted,
-#    not just the exit code, so a silently shrunken selftest cannot pass.
+#    not just the exit code, so a silently shrunken selftest cannot pass. Only the summary
+#    line is echoed: the per-check verdict lines carry a checked_at timestamp, and this
+#    script's output is meant to be byte-identical from run to run.
 selftest_out=$("$GATE" --selftest)
-printf '%s\n' "$selftest_out"
+printf '%s\n' "${selftest_out##*$'\n'}"
 case "$selftest_out" in
   *"32/32 PASS 0 FAIL"*) ;;
   *) echo "SELFTEST COUNT MISMATCH (expected 32/32 PASS 0 FAIL)" >&2; exit 1 ;;
