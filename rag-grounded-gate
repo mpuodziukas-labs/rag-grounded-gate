@@ -2,11 +2,14 @@
 """rag-grounded-gate - deterministic groundedness check for RAG answers.
 Read-only, stdlib-only, no network.
 """
-import sys, os, re, json, hashlib, tempfile, shutil
+import sys, os, re, json, hashlib, tempfile, shutil, io, contextlib
 from datetime import datetime, timezone
+
+__version__ = "2.0.0"
 
 EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 ABSTAIN = "insufficient context"
+CHUNK_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 def now_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -44,11 +47,16 @@ def check_schema(answer, chunks_dir):
         for f in ("span", "chunk_id"):
             if f not in c or not isinstance(c[f], str):
                 return False, f"citations.{f}: missing or wrong type"
+        span = c["span"]
+        if len(span.split()) < 3 or len(span) < 12:
+            return False, "citations.span: too short to be a faithfulness citation"
     for s in answer["grounded_sha256"]:
         if not isinstance(s, str):
             return False, "grounded_sha256: item not str"
     for c in answer["citations"]:
         chunk_id = c["chunk_id"]
+        if "/" in chunk_id or "\\" in chunk_id or ".." in chunk_id or not CHUNK_ID_RE.fullmatch(chunk_id):
+            return False, "chunk_id: invalid path segment"
         meta_path = os.path.join(chunks_dir, f"{chunk_id}.meta.json")
         if not os.path.isfile(meta_path):
             return False, f"meta {chunk_id}: missing meta.json"
@@ -61,19 +69,29 @@ def check_schema(answer, chunks_dir):
         for f in ("utc", "url", "sha256"):
             if f not in meta or not isinstance(meta[f], str):
                 return False, f"meta {chunk_id}.{f}: missing or wrong type"
-        if not re.fullmatch(r"[0-9a-f]{64}", meta["sha256"]):
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", meta["sha256"]):
             return False, f"meta {chunk_id}.sha256: not 64 hex"
+    txt_files = [fn for fn in os.listdir(chunks_dir) if fn.endswith(".txt")] if os.path.isdir(chunks_dir) else []
+    rcc = answer["retrieved_chunks_count"]
+    if (rcc > 0 and len(txt_files) == 0) or (rcc == 0 and len(txt_files) > 0):
+        return False, "retrieved_chunks_count inconsistent with chunks_dir contents"
     return True, "schema ok"
 
 def check_citation_span(answer, chunks_dir):
-    for c in answer.get("citations", []):
+    citations = answer.get("citations", [])
+    if answer.get("retrieved_chunks_count", 0) > 0 and not citations and answer.get("answer") != ABSTAIN:
+        return False, "answer non-empty retrieval requires >=1 citation"
+    for c in citations:
         span = c.get("span", "")
         chunk_id = c.get("chunk_id", "")
         txt_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
         if not os.path.isfile(txt_path):
             return False, f"missing chunk file for citation {chunk_id}"
-        with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-            body = f.read()
+        try:
+            with open(txt_path, "r", encoding="utf-8", errors="strict") as f:
+                body = f.read()
+        except UnicodeDecodeError:
+            return False, f"chunk {chunk_id} is not valid UTF-8"
         if span not in body:
             return False, f"span not verbatim in chunk {chunk_id}: {span!r}"
     return True, "all citation spans matched verbatim"
@@ -89,8 +107,6 @@ def check_abstain_on_empty(answer):
 
 def check_sha_pin(answer, chunks_dir):
     grounded = answer.get("grounded_sha256", []) or []
-    if EMPTY_SHA in grounded:
-        return False, "EMPTY_SHA present in grounded_sha256"
     for c in answer.get("citations", []):
         chunk_id = c.get("chunk_id", "")
         txt_path = os.path.join(chunks_dir, f"{chunk_id}.txt")
@@ -101,11 +117,23 @@ def check_sha_pin(answer, chunks_dir):
             return False, f"chunk {chunk_id} sha256 {actual} not in grounded_sha256"
     return True, "all cited chunk hashes pinned in grounded_sha256"
 
-def check_source_floor(answer, source_min):
-    grounded = answer.get("grounded_sha256", []) or []
-    distinct = len(set(grounded))
+def check_source_floor(answer, chunks_dir, source_min):
+    sources = set()
+    for c in answer.get("citations", []):
+        chunk_id = c.get("chunk_id", "")
+        meta_path = os.path.join(chunks_dir, f"{chunk_id}.meta.json")
+        url = None
+        sha = None
+        try:
+            meta = load_json(meta_path)
+            url = meta.get("url")
+            sha = meta.get("sha256")
+        except Exception:
+            pass
+        sources.add(url or sha or chunk_id)
+    distinct = len(sources)
     ok = distinct >= source_min
-    return ok, f"{distinct} distinct grounded_sha256 (min {source_min})"
+    return ok, f"{distinct} distinct sources (min {source_min})"
 def parse_utc(s):
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 def check_freshness(answer, chunks_dir, ttl):
@@ -127,7 +155,9 @@ def check_freshness(answer, chunks_dir, ttl):
             chunk_dt = parse_utc(meta.get("utc", ""))
         except Exception as e:
             return False, f"bad chunk utc for {chunk_id}: {e}"
-        if abs((gen_dt - chunk_dt).total_seconds()) > ttl and not stale_flag:
+        if chunk_dt > gen_dt:
+            return False, f"chunk {chunk_id} dated after generated_utc"
+        if (gen_dt - chunk_dt).total_seconds() > ttl and not stale_flag:
             return False, f"chunk {chunk_id} stale (> ttl {ttl}s)"
     return True, "all cited chunks within ttl (or stale_flag set)"
 def split_sentences(text):
@@ -161,12 +191,12 @@ def run_check(answer_path, chunks_dir, source_min, ttl=604800, attr_min=0.9):
         return None, f"parse error: {e}"
     schema_ok, schema_detail = check_schema(answer, chunks_dir)
     if not schema_ok:
-        verdict = {"checked_at": now_utc(), "ok": False, "checks": {"schema": {"ok": False, "detail": schema_detail}}}
+        verdict = {"checked_at": now_utc(), "ok": False, "gate_version": __version__, "checks": {"schema": {"ok": False, "detail": schema_detail}}}
         return verdict, None
     checks = {}
     abstain_ok, abstain_detail, abstained_required = check_abstain_on_empty(answer)
     checks["abstain_on_empty"] = {"ok": abstain_ok, "detail": abstain_detail}
-    # EXTENSION POINT: item 5 (contradiction-check) unimplemented; 3/7 are subcommands below.
+    # Not implemented: cross-chunk contradiction detection (see README "Deeper evaluation" section).
     if abstained_required:
         checks["citation_span"] = {"ok": True, "detail": "N/A (abstain-required)"}
         checks["sha_pin"] = {"ok": True, "detail": "N/A (abstain-required)"}
@@ -178,14 +208,14 @@ def run_check(answer_path, chunks_dir, source_min, ttl=604800, attr_min=0.9):
         checks["citation_span"] = {"ok": ok, "detail": detail}
         ok, detail = check_sha_pin(answer, chunks_dir)
         checks["sha_pin"] = {"ok": ok, "detail": detail}
-        ok, detail = check_source_floor(answer, source_min)
+        ok, detail = check_source_floor(answer, chunks_dir, source_min)
         checks["source_floor"] = {"ok": ok, "detail": detail}
         ok, detail = check_freshness(answer, chunks_dir, ttl)
         checks["freshness"] = {"ok": ok, "detail": detail}
         ok, detail = check_attribution_ratio(answer, chunks_dir, attr_min)
         checks["attribution_ratio"] = {"ok": ok, "detail": detail}
     overall_ok = all(v["ok"] for v in checks.values())
-    verdict = {"checked_at": now_utc(), "ok": overall_ok, "checks": checks}
+    verdict = {"checked_at": now_utc(), "ok": overall_ok, "gate_version": __version__, "checks": checks}
     return verdict, None
 
 def strip_checked_at(v):
@@ -217,8 +247,11 @@ def cmd_check(args):
         else:
             print(f"unknown arg {flag}", file=sys.stderr)
             return 2
-    if not os.path.isfile(answer_path) or not os.path.isdir(chunks_dir):
-        print("answer.json or chunks-dir not found", file=sys.stderr)
+    if not os.path.isfile(answer_path):
+        print(f"answer.json not found: {answer_path}", file=sys.stderr)
+        return 2
+    if not os.path.isdir(chunks_dir):
+        print(f"chunks-dir not found: {chunks_dir}", file=sys.stderr)
         return 2
     verdict, err = run_check(answer_path, chunks_dir, vals["--source-min"], vals["--ttl"], vals["--attr-min"])
     if err:
@@ -261,7 +294,7 @@ def run_canary_like(jsonl_path, answers_dir, label):
         if not ok:
             all_ok = False
         results.append({"id": rid, "ok": ok, "detail": "abstained" if ok else "non-abstain"})
-    verdict = {"checked_at": now_utc(), "ok": all_ok, "label": label, "results": results}
+    verdict = {"checked_at": now_utc(), "ok": all_ok, "gate_version": __version__, "label": label, "results": results}
     return verdict, None
 
 def cmd_canary_like(args, label):
@@ -290,7 +323,7 @@ def cmd_replay(args):
         print(f"parse error: {e}", file=sys.stderr)
         return 2
     eq = replay_equal(v1, v2)
-    print(json.dumps({"ok": eq, "detail": "identical" if eq else "differ"}))
+    print(json.dumps({"ok": eq, "gate_version": __version__, "detail": "identical" if eq else "differ"}))
     return 0 if eq else 1
 
 def make_chunk(chunks_dir, chunk_id, body, url="http://example.com/x", utc=None):
@@ -309,14 +342,16 @@ def selftest():
     try:
         chunks_dir = os.path.join(tmp, "chunks")
         os.makedirs(chunks_dir)
-        sha1 = make_chunk(chunks_dir, "c1", "The sky is blue over the valley.")
-        sha2 = make_chunk(chunks_dir, "c2", "Water boils at 100C at sea level.")
+        empty_chunks_dir = os.path.join(tmp, "empty_chunks")
+        os.makedirs(empty_chunks_dir)
+        sha1 = make_chunk(chunks_dir, "c1", "The sky is blue over the valley.", url="http://example.com/sky")
+        sha2 = make_chunk(chunks_dir, "c2", "Water boils at 100C at sea level.", url="http://example.com/water")
 
         base = {
             "question": "q",
             "answer": "The sky is blue and water boils at 100C.",
             "citations": [
-                {"span": "sky is blue", "chunk_id": "c1"},
+                {"span": "The sky is blue", "chunk_id": "c1"},
                 {"span": "boils at 100C", "chunk_id": "c2"},
             ],
             "retrieved_chunks_count": 2,
@@ -345,9 +380,10 @@ def selftest():
         # FAIL: abstain_on_empty - empty retrieval but no abstain literal
         bad = dict(base)
         bad["retrieved_chunks_count"] = 0
+        bad["citations"] = []
         bad["answer"] = "The sky is blue."
         p = write_answer("a_abstain_fail.json", bad)
-        v, err = run_check(p, chunks_dir, 2)
+        v, err = run_check(p, empty_chunks_dir, 2)
         results.append(("abstain_on_empty-fail", err is None and v["checks"]["abstain_on_empty"]["ok"] is False and v["ok"] is False))
 
         # FAIL: sha_pin - tampered grounded_sha256
@@ -360,7 +396,7 @@ def selftest():
         # FAIL: source_floor - only 1 distinct source, min is 2
         bad = dict(base)
         bad["grounded_sha256"] = [sha1, sha1]
-        bad["citations"] = [{"span": "sky is blue", "chunk_id": "c1"}]
+        bad["citations"] = [{"span": "The sky is blue", "chunk_id": "c1"}]
         p = write_answer("a_source_fail.json", bad)
         v, err = run_check(p, chunks_dir, 2)
         results.append(("source_floor-fail", err is None and v["checks"]["source_floor"]["ok"] is False and v["ok"] is False))
@@ -464,6 +500,123 @@ def selftest():
         p = write_answer("a_schema_valid.json", base)
         rc = cmd_check([p, chunks_dir])
         results.append(("schema-valid-rc0", rc == 0))
+
+        # R01 FAIL: nonzero retrieval, zero citations, non-abstaining answer
+        bad = dict(base)
+        bad["citations"] = []
+        bad["answer"] = "The sky is blue and water boils at 100C."
+        p = write_answer("a_r01_empty_citations.json", bad)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("r01-empty-citations-nonzero-retrieval-fail", err is None and v["checks"]["citation_span"]["ok"] is False and v["ok"] is False))
+
+        # R02 FAIL: chunk_id path traversal rejected at schema level, rc 2
+        bad = dict(base)
+        bad["citations"] = [{"span": "TOP SECRET PAYLOAD MARKER", "chunk_id": "../c1"}]
+        p = write_answer("a_r02_path_traversal.json", bad)
+        rc = cmd_check([p, chunks_dir])
+        results.append(("r02-chunk-id-path-traversal-schema-fail-rc2", rc == 2))
+
+        # R03/R20 FAIL: single-character citation span rejected at schema level, rc 2
+        bad = dict(base)
+        bad["citations"] = [{"span": "e", "chunk_id": "c1"}]
+        p = write_answer("a_r03_short_span.json", bad)
+        rc = cmd_check([p, chunks_dir])
+        results.append(("r03-r20-short-span-schema-fail-rc2", rc == 2))
+
+        # R04 FAIL: source_floor counts distinct URLs, not distinct hashes
+        shaX = make_chunk(chunks_dir, "cx1", "Alpha content chunk number one.", url="http://example.com/same-doc")
+        shaY = make_chunk(chunks_dir, "cx2", "Beta content chunk number two.", url="http://example.com/same-doc")
+        bad = dict(base)
+        bad["citations"] = [
+            {"span": "Alpha content chunk number", "chunk_id": "cx1"},
+            {"span": "Beta content chunk number", "chunk_id": "cx2"},
+        ]
+        bad["grounded_sha256"] = [shaX, shaY]
+        bad["answer"] = "Alpha content chunk number one. Beta content chunk number two."
+        p = write_answer("a_r04_same_url.json", bad)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("r04-source-floor-same-url-distinct-hash-fail", err is None and v["checks"]["source_floor"]["ok"] is False and "1 distinct sources" in v["checks"]["source_floor"]["detail"] and v["ok"] is False))
+
+        # R05 FAIL: chunk with an invalid UTF-8 byte cannot be verbatim-matched (no silent U+FFFD substitution)
+        badbytes_path = os.path.join(chunks_dir, "cbad.txt")
+        with open(badbytes_path, "wb") as f:
+            f.write(b"AB\xffCD is not valid data.")
+        sha_bad = sha256_file(badbytes_path)
+        json.dump({"utc": now_utc(), "url": "http://example.com/bad", "sha256": sha_bad},
+                   open(os.path.join(chunks_dir, "cbad.meta.json"), "w"))
+        bad = dict(base)
+        bad["citations"] = [{"span": "AB is not valid data", "chunk_id": "cbad"}]
+        bad["grounded_sha256"] = [sha_bad]
+        p = write_answer("a_r05_invalid_utf8.json", bad)
+        v, err = run_check(p, chunks_dir, 1)
+        results.append(("r05-citation-span-invalid-utf8-fail", err is None and v["checks"]["citation_span"]["ok"] is False and "not valid UTF-8" in v["checks"]["citation_span"]["detail"] and v["ok"] is False))
+
+        # R06 FAIL: EMPTY_SHA in grounded_sha256 still forces abstention even though check_sha_pin's
+        # dead EMPTY_SHA branch was removed; enforcement now lives solely in check_abstain_on_empty.
+        bad = dict(base)
+        bad["grounded_sha256"] = [EMPTY_SHA]
+        bad["answer"] = "The sky is blue."
+        p = write_answer("a_r06_empty_sha_no_abstain.json", bad)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("r06-empty-sha-forces-abstain-fail", err is None and v["checks"]["abstain_on_empty"]["ok"] is False and v["ok"] is False))
+
+        # R08: usage text lists every dispatched subcommand
+        results.append(("r08-usage-text-lists-all-subcommands", all(s in USAGE_TEXT for s in ("check", "replay", "canary", "negcontrol", "--selftest"))))
+
+        # R15: missing answer.json and missing chunks-dir now produce distinct stderr messages
+        p_valid = os.path.join(tmp, "a_pass.json")
+        buf1 = io.StringIO()
+        with contextlib.redirect_stderr(buf1):
+            rc1 = cmd_check([os.path.join(tmp, "does-not-exist.json"), chunks_dir])
+        buf2 = io.StringIO()
+        with contextlib.redirect_stderr(buf2):
+            rc2 = cmd_check([p_valid, os.path.join(tmp, "does-not-exist-dir")])
+        msg1, msg2 = buf1.getvalue(), buf2.getvalue()
+        results.append(("r15-distinct-missing-path-errors", rc1 == 2 and rc2 == 2 and "answer.json not found" in msg1 and "chunks-dir not found" in msg2 and msg1 != msg2))
+
+        # R16 FAIL: retrieved_chunks_count > 0 claimed against a genuinely empty chunks_dir -> schema fail rc 2
+        bad = dict(base)
+        bad["retrieved_chunks_count"] = 3
+        bad["citations"] = []
+        p = write_answer("a_r16_empty_dir_claim.json", bad)
+        rc = cmd_check([p, empty_chunks_dir])
+        results.append(("r16-rcc-nonzero-empty-dir-schema-fail-rc2", rc == 2))
+
+        # R24: -h and --help print usage and exit 0
+        buf3 = io.StringIO()
+        with contextlib.redirect_stdout(buf3):
+            rc_help1 = main(["--help"])
+        buf4 = io.StringIO()
+        with contextlib.redirect_stdout(buf4):
+            rc_help2 = main(["-h"])
+        results.append(("r24-help-flags-rc0", rc_help1 == 0 and rc_help2 == 0 and "check" in buf3.getvalue() and "check" in buf4.getvalue()))
+
+        # R25: every verdict carries gate_version, and --version prints it
+        v, err = run_check(p_valid, chunks_dir, 2)
+        buf5 = io.StringIO()
+        with contextlib.redirect_stdout(buf5):
+            rc_ver = main(["--version"])
+        results.append(("r25-gate-version-stamped-and-version-flag", err is None and v.get("gate_version") == __version__ and rc_ver == 0 and buf5.getvalue().strip() == __version__))
+
+        # R27 PASS: uppercase-hex SHA-256 in meta.json is now accepted by schema (not just lowercase)
+        meta_path_c1 = os.path.join(chunks_dir, "c1.meta.json")
+        orig_meta_c1 = load_json(meta_path_c1)
+        upper_meta = dict(orig_meta_c1)
+        upper_meta["sha256"] = upper_meta["sha256"].upper()
+        json.dump(upper_meta, open(meta_path_c1, "w"))
+        p = write_answer("a_r27_uppercase_sha.json", base)
+        v, err = run_check(p, chunks_dir, 2)
+        results.append(("r27-uppercase-sha256-accepted", err is None and "schema" not in v["checks"] and v["ok"] is True))
+        json.dump(orig_meta_c1, open(meta_path_c1, "w"))  # restore
+
+        # R29 FAIL: a chunk dated after generated_utc fails freshness unconditionally, even under a huge ttl
+        future_sha = make_chunk(chunks_dir, "cfuture", "The event happens far in the future.", utc="2099-01-01T00:00:00Z")
+        bad = dict(base)
+        bad["citations"] = [{"span": "event happens far in the future", "chunk_id": "cfuture"}]
+        bad["grounded_sha256"] = [future_sha]
+        p = write_answer("a_r29_future_chunk.json", bad)
+        v, err = run_check(p, chunks_dir, 1, ttl=10**12)
+        results.append(("r29-freshness-future-chunk-fail", err is None and v["checks"]["freshness"]["ok"] is False and "dated after generated_utc" in v["checks"]["freshness"]["detail"] and v["ok"] is False))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -476,11 +629,20 @@ def selftest():
     print(f"rag-grounded-gate selftest: {passed}/{total} PASS {failed} FAIL")
     return 0 if failed == 0 else 1
 
-def main():
-    argv = sys.argv[1:]
+USAGE_TEXT = "usage: rag-grounded-gate {check|replay|canary|negcontrol|--selftest} ..."
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
     if not argv:
-        print("usage: rag-grounded-gate {check|replay|--selftest} ...", file=sys.stderr)
+        print(USAGE_TEXT, file=sys.stderr)
         return 2
+    if argv[0] in ("-h", "--help"):
+        print(USAGE_TEXT)
+        return 0
+    if argv[0] == "--version":
+        print(__version__)
+        return 0
     if argv[0] == "--selftest":
         return selftest()
     if argv[0] == "check":

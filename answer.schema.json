@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mpuodziukas-labs/rag-grounded-gate/answer.schema.json",
+  "title": "rag-grounded-gate answer.json",
+  "description": "Contract for the answer.json input consumed by rag-grounded-gate check. This file documents the same constraints check_schema() enforces in rag-grounded-gate; it is not run by the tool itself.",
+  "type": "object",
+  "required": [
+    "question",
+    "answer",
+    "citations",
+    "retrieved_chunks_count",
+    "grounded_sha256",
+    "generated_utc",
+    "stale_flag"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "question": {
+      "type": "string"
+    },
+    "answer": {
+      "type": "string"
+    },
+    "citations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["span", "chunk_id"],
+        "additionalProperties": true,
+        "properties": {
+          "span": {
+            "type": "string",
+            "minLength": 12,
+            "description": "Must also contain at least 3 whitespace-delimited words; short spans are rejected as too weak to serve as a faithfulness citation."
+          },
+          "chunk_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "description": "Restricted to a safe filename character set. No '/', '\\', or '..' segments; the gate resolves this against chunks_dir as <chunk_id>.txt and <chunk_id>.meta.json."
+          }
+        }
+      }
+    },
+    "retrieved_chunks_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Self-reported by the caller. The gate cross-checks it against whether chunks_dir contains any .txt files, but does not verify the exact count."
+    },
+    "grounded_sha256": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "generated_utc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$",
+      "description": "UTC timestamp, format %Y-%m-%dT%H:%M:%SZ."
+    },
+    "stale_flag": {
+      "type": "boolean"
+    }
+  }
+}

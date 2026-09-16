@@ -15,7 +15,7 @@ isolate a single check.
 | 04 | 04-span-mismatch | `rag-grounded-gate check fixtures/04-span-mismatch/answer.json fixtures/04-span-mismatch/chunks` | 1 | citation_span, attribution_ratio (a mismatched span also fails the attribution check, which re-derives verified spans independently) |
 | 05 | 05-sha-unpinned | `rag-grounded-gate check fixtures/05-sha-unpinned/answer.json fixtures/05-sha-unpinned/chunks` | 1 | sha_pin |
 | 06 | 06-source-floor-one-source | `rag-grounded-gate check fixtures/06-source-floor-one-source/answer.json fixtures/06-source-floor-one-source/chunks` | 1 | source_floor |
-| 07 | 07-stale-chunk-no-flag | `rag-grounded-gate check fixtures/07-stale-chunk-no-flag/answer.json fixtures/07-stale-chunk-no-flag/chunks --ttl 1` | 1 | freshness |
+| 07 | 07-stale-chunk-no-flag | `rag-grounded-gate check fixtures/07-stale-chunk-no-flag/answer.json fixtures/07-stale-chunk-no-flag/chunks` | 1 | freshness |
 | 08 | 08-attribution-ratio-low | `rag-grounded-gate check fixtures/08-attribution-ratio-low/answer.json fixtures/08-attribution-ratio-low/chunks` | 1 | attribution_ratio |
 | 09 | 09-schema-missing-field | `rag-grounded-gate check fixtures/09-schema-missing-field/answer.json fixtures/09-schema-missing-field/chunks` | 2 | schema (generated_utc missing) |
 
@@ -26,23 +26,25 @@ sentence-splitter) was adjusted to hit the intended check.
 ## Reproduce
 
 ```bash
-./rag-grounded-gate --selftest   # 19 assertions, self-contained, builds its own fixtures
+./rag-grounded-gate --selftest   # 32 assertions, self-contained, builds its own fixtures
 bash REPRO.sh                    # runs all nine fixtures above and prints "REPRO OK"
 ```
 
 Every result reproduces from a clean `git clone` with no network and no external data. Python 3
 standard library only.
 
+Every file under `fixtures/` (each `answer.json`, each chunk `.txt`, each chunk `.meta.json`) is
+written byte-exact with no trailing newline, by design. That is not an artifact of how they were
+generated; do not add a trailing newline when comparing or regenerating them.
+
 ## Deeper suite (not bundled)
 
-Beyond these nine fixtures I run the gate against 20 planted anti-fact canaries and 20
-real-shaped negative controls:
-
-* The canaries plant 20 fabricated terms (a made-up protocol name, a fake RFC number, a fake
-  pricing tier), each confirmed absent from the source corpus by a literal grep.
-* The negative controls ask 20 real-shaped questions on topics next to the corpus (pricing, GDPR,
-  ARM64, Kubernetes, licensing, SLAs), each also confirmed corpus-absent.
-
-Both sets require every answer to abstain (`"insufficient context"`). A single confident,
-non-abstaining answer flips the command's exit code from 0 to 1. That corpus is not shipped here.
-I run it live, or point it at your own chunk store, on request.
+Past these nine fixtures, the gate is run against a private suite of 20 planted anti-fact
+canaries (fabricated entities, numbers, and dates confirmed absent from the corpus) and 20
+real-shaped negative controls (plausible questions on topics the corpus doesn't cover). Both
+require abstention. The last recorded run (2026-09-12) has three receipts: the 20 canary rows
+with correct answers pass (exit `0`); one planted leak in a canary answer fails the suite
+(exit `1`); one planted leak in a negative-control answer fails the suite (exit `1`). A single
+non-abstaining answer flips the suite's exit code. The corpus and the receipts are not shipped
+here, so treat this section as a description of method, not as evidence checkable from this
+repo.
